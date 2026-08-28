@@ -164,9 +164,101 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
         self.online_ind = 0
         self.online_track_feat = [None] * self.corr_levels
         self.online_track_support = [None] * self.corr_levels
+        self.online_fmaps_pyramid = None
         self.online_coords_predicted = None
         self.online_vis_predicted = None
         self.online_conf_predicted = None
+
+    def _compute_fmaps_pyramid(
+        self, video, is_train=False, fmaps_chunk_size=200, output_dtype=None
+    ):
+        B, T, C, H, W = video.shape
+
+        if (not is_train) and (T > fmaps_chunk_size):
+            encoded_chunks = []
+            for t in range(0, T, fmaps_chunk_size):
+                video_chunk = video[:, t : t + fmaps_chunk_size]
+                encoded_chunk = self.fnet(video_chunk.reshape(-1, C, H, W))
+                chunk_frames = video_chunk.shape[1]
+                encoded_chunks.append(
+                    encoded_chunk.reshape(B, chunk_frames, *encoded_chunk.shape[1:])
+                )
+            fmaps = torch.cat(encoded_chunks, dim=1)
+        else:
+            fmaps = self.fnet(video.reshape(-1, C, H, W))
+            fmaps = fmaps.reshape(B, T, *fmaps.shape[1:])
+
+        feature_norm = torch.sqrt(
+            torch.clamp_min(torch.sum(torch.square(fmaps), dim=2, keepdim=True), 1e-12)
+        )
+        fmaps = fmaps / feature_norm
+        if output_dtype is not None:
+            fmaps = fmaps.to(output_dtype)
+
+        fmaps_pyramid = [fmaps]
+        for _ in range(self.corr_levels - 1):
+            previous = fmaps_pyramid[-1]
+            pooled = F.avg_pool2d(
+                previous.reshape(B * T, self.latent_dim, *previous.shape[-2:]),
+                2,
+                stride=2,
+            )
+            fmaps_pyramid.append(
+                pooled.reshape(B, T, self.latent_dim, *pooled.shape[-2:])
+            )
+        return fmaps_pyramid
+
+    def _get_fmaps_pyramid(
+        self,
+        video,
+        is_online,
+        is_train=False,
+        step=1,
+        fmaps_chunk_size=200,
+        output_dtype=None,
+    ):
+        B, T, _, H, W = video.shape
+        cached = self.online_fmaps_pyramid if is_online else None
+        can_reuse_cache = (
+            cached is not None
+            and T == self.window_len
+            and 0 < step < self.window_len
+            and cached[0].shape
+            == (
+                B,
+                self.window_len,
+                self.latent_dim,
+                H // self.stride,
+                W // self.stride,
+            )
+            and cached[0].device == video.device
+        )
+
+        if can_reuse_cache:
+            new_fmaps = self._compute_fmaps_pyramid(
+                video[:, -step:],
+                is_train=is_train,
+                fmaps_chunk_size=fmaps_chunk_size,
+                output_dtype=output_dtype,
+            )
+            fmaps_pyramid = [
+                torch.cat([old[:, step:], new], dim=1)
+                for old, new in zip(cached, new_fmaps)
+            ]
+        else:
+            fmaps_pyramid = self._compute_fmaps_pyramid(
+                video,
+                is_train=is_train,
+                fmaps_chunk_size=fmaps_chunk_size,
+                output_dtype=output_dtype,
+            )
+
+        if is_online and T == self.window_len:
+            self.online_fmaps_pyramid = [fmaps.detach() for fmaps in fmaps_pyramid]
+        elif is_online:
+            self.online_fmaps_pyramid = None
+
+        return fmaps_pyramid
 
     def forward_window(
         self,
@@ -366,47 +458,17 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
             [],
         )
 
-        C_ = C
-        H4, W4 = H // self.stride, W // self.stride
-
-        # Compute convolutional features for the video or for the current chunk in case of online mode
-        if (not is_train) and (T > fmaps_chunk_size):
-            fmaps = []
-            for t in range(0, T, fmaps_chunk_size):
-                video_chunk = video[:, t : t + fmaps_chunk_size]
-                fmaps_chunk = self.fnet(video_chunk.reshape(-1, C_, H, W))
-                T_chunk = video_chunk.shape[1]
-                C_chunk, H_chunk, W_chunk = fmaps_chunk.shape[1:]
-                fmaps.append(fmaps_chunk.reshape(B, T_chunk, C_chunk, H_chunk, W_chunk))
-            fmaps = torch.cat(fmaps, dim=1).reshape(-1, C_chunk, H_chunk, W_chunk)
-        else:
-            fmaps = self.fnet(video.reshape(-1, C_, H, W))
-        fmaps = fmaps.permute(0, 2, 3, 1)
-        fmaps = fmaps / torch.sqrt(
-            torch.maximum(
-                torch.sum(torch.square(fmaps), axis=-1, keepdims=True),
-                torch.tensor(1e-12, device=fmaps.device),
-            )
+        fmaps_pyramid = self._get_fmaps_pyramid(
+            video,
+            is_online=is_online,
+            is_train=is_train,
+            step=step,
+            fmaps_chunk_size=fmaps_chunk_size,
+            output_dtype=dtype,
         )
-        fmaps = fmaps.permute(0, 3, 1, 2).reshape(
-            B, -1, self.latent_dim, H // self.stride, W // self.stride
-        )
-        fmaps = fmaps.to(dtype)
 
-        # We compute track features
-        fmaps_pyramid = []
         track_feat_pyramid = []
         track_feat_support_pyramid = []
-        fmaps_pyramid.append(fmaps)
-        for i in range(self.corr_levels - 1):
-            fmaps_ = fmaps.reshape(
-                B * T_pad, self.latent_dim, fmaps.shape[-2], fmaps.shape[-1]
-            )
-            fmaps_ = F.avg_pool2d(fmaps_, 2, stride=2)
-            fmaps = fmaps_.reshape(
-                B, T_pad, self.latent_dim, fmaps_.shape[-2], fmaps_.shape[-1]
-            )
-            fmaps_pyramid.append(fmaps)
         if is_online:
             sample_frames = queried_frames[:, None, :, None]  # B 1 N 1
             left = 0 if self.online_ind == 0 else self.online_ind + step
