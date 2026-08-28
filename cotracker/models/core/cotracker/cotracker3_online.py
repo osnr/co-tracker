@@ -315,7 +315,7 @@ class CoTrackerThreeOnline(CoTrackerThreeBase):
             ), "Call model.init_video_online_processing() first."
             assert not is_train, "Training not supported in online mode."
 
-        step = S // 2  # How much the sliding window moves at every step
+        step = 1  # Process one new frame at a time.
 
         video = 2 * (video / 255.0) - 1.0
         pad = (

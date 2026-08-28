@@ -54,7 +54,8 @@ if __name__ == "__main__":
     def _process_step(window_frames, is_first_step, grid_size, grid_query_frame):
         video_chunk = (
             torch.tensor(
-                np.stack(window_frames[-model.step * 2 :]), device=DEFAULT_DEVICE
+                np.stack(window_frames[-model.model.window_len :]),
+                device=DEFAULT_DEVICE,
             )
             .float()
             .permute(0, 3, 1, 2)[None]
@@ -74,7 +75,8 @@ if __name__ == "__main__":
             plugin="FFMPEG",
         )
     ):
-        if i % model.step == 0 and i != 0:
+        window_frames.append(frame)
+        if i % model.step == 0 and i >= model.model.window_len - 1:
             pred_tracks, pred_visibility = _process_step(
                 window_frames,
                 is_first_step,
@@ -82,14 +84,6 @@ if __name__ == "__main__":
                 grid_query_frame=args.grid_query_frame,
             )
             is_first_step = False
-        window_frames.append(frame)
-    # Processing the final video frames in case video length is not a multiple of model.step
-    pred_tracks, pred_visibility = _process_step(
-        window_frames[-(i % model.step) - model.step - 1 :],
-        is_first_step,
-        grid_size=args.grid_size,
-        grid_query_frame=args.grid_query_frame,
-    )
 
     print("Tracks are computed")
 
